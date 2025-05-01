@@ -5,6 +5,7 @@ Git差异分析模块 - 负责分析Git仓库的变更
 import os
 import re
 import logging
+import subprocess
 from typing import Dict, List, Any, Optional, Tuple
 from git import Repo, GitCommandError
 from git.diff import Diff
@@ -12,33 +13,17 @@ from git.diff import Diff
 from sf_ai_commit.constants import (
     GIT_DIFF_ENCODING,
     GIT_DEFAULT_REPO_PATH,
+    GIT_DEFAULT_DIFF_MAX_LINES,
     ERROR_GIT_REPO_NOT_FOUND,
     ERROR_GIT_NO_STAGED_CHANGES
 )
-
-def is_binary_string(content: bytes) -> bool:
-    """
-    判断内容是否是二进制字符串
-    
-    Args:
-        content: 待检查的内容
-        
-    Returns:
-        如果内容包含空字节或不可打印字符比例较高则返回True
-    """
-    # 检查是否包含空字节，这通常表明是二进制数据
-    if b'\x00' in content:
-        return True
-        
-    # 检查不可打印字符比例
-    printable_chars = 0
-    for byte in content:
-        # ASCII 可打印字符范围大致为 32-126 加上 9(Tab)、10(LF)、13(CR)
-        if (32 <= byte <= 126) or byte in (9, 10, 13):
-            printable_chars += 1
-    
-    # 如果可打印字符少于75%，可能是二进制文件
-    return printable_chars / len(content) < 0.75 if content else False
+from sf_ai_commit.utils import (
+    is_binary_file,
+    is_binary_stream,
+    analyze_diff_content,
+    extract_meaningful_diff_content,
+    extract_meaningful_code_lines
+)
 
 class GitAnalyzer:
     """分析Git仓库的变更"""
@@ -106,132 +91,102 @@ class GitAnalyzer:
         is_empty = self.is_empty_repo()
         self.logger.debug(f"仓库状态: {'空仓库（首次提交）' if is_empty else '已有提交历史'}")
         
-        # 获取索引(暂存区)和HEAD之间的差异
+        # 初始化差异列表
+        diffs = []
+        
+        # 获取已有文件的暂存区差异
         if not is_empty:
-            diffs = list(self.repo.index.diff(self.repo.head.commit, staged=True))
-        else:
-            # 首次提交，没有历史提交可比较
-            diffs = []
-            self.logger.debug("首次提交，没有历史差异可比较")
+            try:
+                # 获取索引(暂存区)和HEAD之间的差异
+                diffs = list(self.repo.index.diff(self.repo.head.commit, staged=True))
+                self.logger.debug(f"从索引和HEAD获取差异: {len(diffs)} 个")
+            except Exception as e:
+                self.logger.warning(f"获取暂存区差异时出错: {str(e)}")
         
-        # 检查未跟踪但已暂存的文件（新添加的文件）
-        # 处理新添加的文件
+        # 处理暂存区中的新文件
         try:
-            index_entries = self.repo.index.entries
-            self.logger.debug(f"处理暂存区的新文件，共 {len(index_entries)} 个条目")
+            # 使用 git status --porcelain 直接获取更可靠的状态信息
+            status_output = self.repo.git.status(porcelain=True)
+            self.logger.debug(f"Git状态输出: {status_output}")
             
-            # 设置 head_tree
-            head_tree = None if is_empty else self.repo.head.commit.tree
-            if is_empty:
-                self.logger.debug("首次提交，没有 HEAD 引用")
-            
-            for entry in index_entries:
-                path = entry[0]
-                try:
-                    # 检查文件是否在 HEAD 中存在
-                    if head_tree is not None:
-                        head_tree[path]
-                        continue  # 如果存在则跳过，因为已经在 diff 中了
-                except (KeyError, AttributeError):
-                    pass  # 文件不在 HEAD 中，继续处理
-                
-                # 处理新文件
-                try:
-                    # 简化新文件处理逻辑，使用git命令获取差异而不是读取文件内容
-                    self.logger.debug(f"处理新文件: {path}")
+            # 解析状态输出，提取新添加和已删除文件
+            for line in status_output.splitlines():
+                if not line or len(line) < 3:
+                    continue
                     
-                    # 使用git show获取新文件内容和差异信息
+                status_code = line[:2].strip()
+                file_path = line[3:].strip()
+                
+                # 跳过未暂存文件 (如果状态码不包含 A - 新增)
+                if 'A' not in status_code:
+                    continue
+                
+                # 处理已暂存的新文件
+                self.logger.debug(f"处理暂存区的新文件: {file_path} (状态: {status_code})")
+                
+                # 检查文件是否已经在差异列表中
+                if any(getattr(diff, 'b_path', '') == file_path for diff in diffs):
+                    self.logger.debug(f"文件 {file_path} 已在差异列表中，跳过")
+                    continue
+                
+                # 获取文件的完整路径
+                full_path = os.path.join(self.repo_path, file_path)
+                
+                # 检查文件是否存在
+                if not os.path.exists(full_path):
+                    self.logger.warning(f"文件 {file_path} 不存在，跳过")
+                    continue
+                
+                # 检查是否是二进制文件
+                is_binary = is_binary_file(full_path)
+                
+                # 为新文件创建差异内容
+                if is_binary:
+                    # 二进制文件使用简单的差异表示
+                    diff_content = f"diff --git a/{file_path} b/{file_path}\nnew file mode 100644\nBinary files /dev/null and b/{file_path} differ\n"
+                else:
                     try:
-                        # 使用git diff --cached 获取暂存区的差异
-                        diff_output = self.repo.git.diff("--cached", "--", path, no_prefix=False)
+                        # 使用 git diff --cached 获取新文件的差异输出
+                        diff_output = self.repo.git.diff("--cached", "--", file_path)
                         
-                        # 如果diff输出为空（对于新文件可能发生），使用简单格式构建差异信息
-                        if not diff_output:
-                            # 检查文件是否是二进制文件
-                            is_binary = False
+                        if diff_output:
+                            diff_content = diff_output
+                        else:
+                            # 手动构建差异内容
                             try:
-                                # 使用git命令检查是否是二进制文件
-                                self.repo.git.check_attr("binary", "--", path)
-                                is_binary = True
-                            except:
-                                pass
+                                with open(full_path, 'r', encoding=GIT_DIFF_ENCODING, errors='replace') as f:
+                                    file_content = f.read()
                                 
-                            if is_binary:
-                                diff_output = f"diff --git a/{path} b/{path}\nnew file mode 100644\nBinary files /dev/null and b/{path} differ\n"
-                            else:
-                                diff_output = f"diff --git a/{path} b/{path}\nnew file mode 100644\n"
-                        
-                        # 创建模拟的 Diff 对象
-                        mock_diff = type('MockDiff', (), {
-                            'a_path': path,
-                            'b_path': path,
-                            'new_file': True,
-                            'renamed': False,
-                            'deleted_file': False,
-                            'diff': diff_output.encode(GIT_DIFF_ENCODING) if isinstance(diff_output, str) else diff_output,
-                            'change_type': 'added'
-                        })
-                        diffs.append(mock_diff)
+                                lines = file_content.splitlines()
+                                diff_content = f"diff --git a/{file_path} b/{file_path}\nnew file mode 100644\n--- /dev/null\n+++ b/{file_path}\n@@ -0,0 +1,{len(lines)} @@\n"
+                                for line in lines:
+                                    diff_content += f"+{line}\n"
+                            except UnicodeDecodeError:
+                                # 如果解码失败，可能是二进制文件
+                                is_binary = True
+                                diff_content = f"diff --git a/{file_path} b/{file_path}\nnew file mode 100644\nBinary files /dev/null and b/{file_path} differ\n"
                     except Exception as e:
-                        self.logger.warning(f"获取新文件 {path} 的差异时出错: {str(e)}")
-                    else:
-                        # 首次提交的情况
-                        self.logger.debug(f"处理首次提交的新文件: {path}")
-                        
-                        # 直接获取文件内容
-                        try:
-                            # 获取文件内容
-                            file_path = os.path.join(self.repo_path, path)
-                            
-                            # 使用file命令检查文件类型
-                            import subprocess
-                            file_type_output = subprocess.check_output(['file', '-b', file_path], universal_newlines=True)
-                            is_binary = 'text' not in file_type_output.lower()
-                            
-                            # 创建适当的差异内容
-                            if is_binary:
-                                diff_content = f'diff --git a/{path} b/{path}\nnew file mode 100644\nBinary files /dev/null and b/{path} differ\n'
-                            else:
-                                # 使用git命令生成差异内容
-                                try:
-                                    # 使用cat-file命令获取blob内容
-                                    blob_id = self.repo.index[path].hexsha
-                                    blob_content = self.repo.git.cat_file("blob", blob_id)
-                                    
-                                    # 创建差异输出
-                                    lines = blob_content.splitlines()
-                                    diff_content = f'diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n'
-                                    for line in lines:
-                                        diff_content += f'+{line}\n'
-                                except Exception as e:
-                                    self.logger.debug(f"使用git方式获取内容失败: {str(e)}")
-                                    # 如果git方式失败，使用直接读取文件的备选方案
-                                    with open(file_path, 'r', encoding=GIT_DIFF_ENCODING, errors='replace') as f:
-                                        file_content = f.read()
-                                    
-                                    lines = file_content.splitlines()
-                                    diff_content = f'diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n'
-                                    for line in lines:
-                                        diff_content += f'+{line}\n'
-                            
-                            # 创建一个模拟的 Diff 对象
-                            mock_diff = type('MockDiff', (), {
-                                'a_path': path,
-                                'b_path': path,
-                                'new_file': True,
-                                'renamed': False,
-                                'deleted_file': False,
-                                'diff': diff_content.encode(GIT_DIFF_ENCODING) if isinstance(diff_content, str) else diff_content,
-                                'change_type': 'added'
-                            })
-                            diffs.append(mock_diff)
-                        except Exception as e:
-                            self.logger.warning(f"处理首次提交的新文件 {path} 时出错: {str(e)}")
-                except Exception as e:
-                    self.logger.warning(f"处理新文件 {path} 时出错: {str(e)}")
+                        self.logger.warning(f"获取新文件 {file_path} 的差异时出错: {str(e)}")
+                        # 使用简单的差异表示作为后备
+                        diff_content = f"diff --git a/{file_path} b/{file_path}\nnew file mode 100644\n"
+                
+                # 创建模拟的 Diff 对象
+                mock_diff = type('MockDiff', (), {
+                    'a_path': '',  # 新文件没有原始路径
+                    'b_path': file_path,
+                    'new_file': True,
+                    'renamed': False,
+                    'deleted_file': False,
+                    'diff': diff_content.encode(GIT_DIFF_ENCODING) if isinstance(diff_content, str) else diff_content,
+                    'change_type': 'added',
+                    'is_binary': is_binary
+                })
+                
+                diffs.append(mock_diff)
         except Exception as e:
-            self.logger.warning(f"处理新文件时出错: {str(e)}")
+            self.logger.warning(f"处理暂存区的新文件时出错: {str(e)}")
         
+        # 检查是否有暂存的变更
         if not diffs:
             self.logger.warning("没有检测到暂存的变更")
             raise ValueError(ERROR_GIT_NO_STAGED_CHANGES)
@@ -428,7 +383,8 @@ class GitAnalyzer:
             "blocks": []
         }
         
-        is_binary = False
+        # 检查是否已指定二进制文件标志
+        is_binary = getattr(diff, 'is_binary', False)
         diff_content = ""
         code_blocks = []
         
@@ -441,13 +397,36 @@ class GitAnalyzer:
                     if isinstance(diff.diff, str):
                         diff_content = diff.diff
                     elif isinstance(diff.diff, bytes):
-                        diff_content = diff.diff.decode(GIT_DIFF_ENCODING)
+                        diff_content = diff.diff.decode(GIT_DIFF_ENCODING, errors='replace')
                     else:
                         # 使用str()处理其他类型
                         diff_content = str(diff.diff)
+                    
+                    # 检查是否是二进制文件
+                    if "Binary files" in diff_content:
+                        is_binary = True
+                    
+                    if not is_binary:
+                        # 使用工具函数分析差异内容获取统计和代码块
+                        stats, code_blocks = analyze_diff_content(diff_content)
                         
-                    # 分析差异内容获取统计和代码块
-                    stats, code_blocks = self._analyze_diff_content(diff_content)
+                        # 如果统计中没有行数信息，尝试直接从git获取
+                        if not stats.get("insertions") and not stats.get("deletions"):
+                            try:
+                                # 使用git diff --numstat获取更准确的统计数据
+                                numstat_output = self.repo.git.diff("--cached", "--numstat", "--", new_path)
+                                if numstat_output:
+                                    parts = numstat_output.strip().split("\t")
+                                    if len(parts) >= 2:
+                                        try:
+                                            insertions = int(parts[0]) if parts[0] != "-" else 0
+                                            deletions = int(parts[1]) if parts[1] != "-" else 0
+                                            stats["insertions"] = insertions
+                                            stats["deletions"] = deletions
+                                        except ValueError:
+                                            pass
+                            except Exception as e:
+                                self.logger.debug(f"使用git numstat获取行数统计失败: {str(e)}")
                 except Exception as e:
                     self.logger.debug(f"无法解码文件差异内容: {str(e)}")
                     diff_content = "(binary file or decode error)"
@@ -455,26 +434,15 @@ class GitAnalyzer:
         except Exception as e:
             self.logger.warning(f"分析差异内容时出错: {str(e)}")
         
-        # 检查文件内容以确定是否是二进制文件 - 使用安全访问
-        if not is_binary:
+        # 如果没有确定是否为二进制文件，尝试通过其他方式检查
+        if not is_binary and new_path:
             try:
-                b_blob = getattr(diff, 'b_blob', None)
-                a_blob = getattr(diff, 'a_blob', None)
-                blob = b_blob if b_blob else a_blob
-                
-                if blob and hasattr(blob, 'data_stream'):
-                    try:
-                        # 读取文件的前8KB来判断是否为二进制文件
-                        content_sample = blob.data_stream.read(8192)
-                        is_binary = is_binary_string(content_sample)
-                        # 需要重置流以供后续使用
-                        blob.data_stream.close()
-                    except Exception as e:
-                        self.logger.debug(f"读取文件内容时出错: {str(e)}")
-                        is_binary = True
+                # 检查完整路径下的文件
+                full_path = os.path.join(self.repo_path, new_path)
+                if os.path.exists(full_path):
+                    is_binary = is_binary_file(full_path)
             except Exception as e:
-                self.logger.debug(f"判断文件类型时出错: {str(e)}")
-                is_binary = True
+                self.logger.debug(f"通过文件检查二进制类型时出错: {str(e)}")
         
         # 获取文件扩展名以识别文件类型
         _, file_ext = os.path.splitext(new_path)
@@ -492,14 +460,13 @@ class GitAnalyzer:
         }
     
     def _generate_text_summary(self, files_stats: List[Dict[str, Any]],
-                             total_stats: Dict[str, Any]) -> str:
+                              total_stats: Dict[str, Any]) -> str:
         """
-        生成差异的文本摘要
+        生成差异的文本摘要，结构化输出文件类型和数量
         
         Args:
             files_stats: 文件变更统计信息列表
-            total_insertions: 总插入行数
-            total_deletions: 总删除行数
+            total_stats: 总体统计信息
             
         Returns:
             差异的文本摘要
@@ -508,27 +475,41 @@ class GitAnalyzer:
         
         # 添加总体统计信息
         total_files = len(files_stats)
-        insertions = total_stats["insertions"]
-        deletions = total_stats["deletions"]
+        
+        # 确保插入和删除行数正确计算
+        insertions = 0
+        deletions = 0
+        
+        # 直接从文件统计中计算，避免使用可能不准确的total_stats
+        for file_stat in files_stats:
+            insertions += file_stat.get("insertions", 0)
+            deletions += file_stat.get("deletions", 0)
+        
+        # 更新total_stats中的值，确保其他地方使用时也是正确的
+        total_stats["insertions"] = insertions
+        total_stats["deletions"] = deletions
         
         summary_lines.append(f"变更概览: 共 {total_files} 个文件")
         summary_lines.append(f"代码变更: +{insertions} -{deletions} 行")
         
-        # 按文件类型分组显示变更
-        summary_lines.append("\n按文件类型统计:")
-        for file_type, type_stats in total_stats["by_type"].items():
-            count = len(type_stats["files"])
-            type_insertions = type_stats["insertions"]
-            type_deletions = type_stats["deletions"]
-            summary_lines.append(f"- {file_type}: {count}个文件 (+{type_insertions} -{type_deletions})")
+        # 按变更类型统计文件数量
+        change_type_counts = {
+            "added": 0,
+            "modified": 0,
+            "deleted": 0,
+            "renamed": 0,
+            "moved": 0,
+            "renamed_modified": 0,
+            "moved_modified": 0
+        }
         
-        # 显示重要变更
-        if total_stats["files"]["renamed"] or total_stats["files"]["moved"]:
-            summary_lines.append("\n文件重命名/移动:")
-            for file_info in total_stats["files"]["renamed"] + total_stats["files"]["moved"]:
-                summary_lines.append(f"- {file_info['path']}")
+        for file_stat in files_stats:
+            change_type = file_stat.get("change_type", "modified")
+            if change_type in change_type_counts:
+                change_type_counts[change_type] += 1
         
-        # 按变更类型显示文件
+        # 添加变更类型统计
+        change_type_summary = []
         change_type_desc = {
             "added": "新增",
             "modified": "修改",
@@ -539,37 +520,33 @@ class GitAnalyzer:
             "moved_modified": "移动并修改"
         }
         
-        # 获取最重要的变更
-        important_files = sorted(
-            [f for f in files_stats if f["change_type"] != "deleted"],
-            key=lambda x: self._calculate_impact_score(x),
-            reverse=True
-        )[:5]  # 最多显示5个重要变更
+        for change_type, count in change_type_counts.items():
+            if count > 0:
+                desc = change_type_desc.get(change_type, change_type)
+                change_type_summary.append(f"{desc}: {count}个")
         
-        if important_files:
-            summary_lines.append("\n重要变更:")
-            for file_stat in important_files:
-                path = file_stat["path"]
-                change_type = change_type_desc.get(file_stat["change_type"], "修改")
-                insertions = file_stat.get("insertions", 0)
-                deletions = file_stat.get("deletions", 0)
-                
-                summary_lines.append(f"- {change_type}: {path} (+{insertions} -{deletions})")
-                
-                # 对于重要变更，显示关键代码块
-                if not file_stat.get("is_binary") and file_stat.get("code_blocks"):
-                    significant_blocks = self._get_significant_blocks(file_stat["code_blocks"])
-                    if significant_blocks:
-                        summary_lines.append("  主要变更:")
-                        for block in significant_blocks:
-                            summary_lines.append("  ```")
-                            # 只显示每个代码块的前几行
-                            block_preview = "\n  ".join(block.split("\n")[:5])
-                            if len(block.split("\n")) > 5:
-                                block_preview += "\n  ..."
-                            summary_lines.append("  " + block_preview)
-                            summary_lines.append("  ```")
-                
+        if change_type_summary:
+            summary_lines.append("变更类型: " + ", ".join(change_type_summary))
+        
+        # 按文件类型分组显示变更
+        summary_lines.append("\n按文件类型统计:")
+        for file_type, type_stats in total_stats["by_type"].items():
+            count = len(type_stats["files"])
+            type_insertions = type_stats["insertions"]
+            type_deletions = type_stats["deletions"]
+            summary_lines.append(f"- {file_type}: {count}个文件 (+{type_insertions} -{type_deletions})")
+        
+        # 显示重命名和移动的文件
+        if total_stats["files"]["renamed"] or total_stats["files"]["moved"]:
+            summary_lines.append("\n文件重命名/移动:")
+            # 按路径排序，让输出更一致
+            renamed_moved = sorted(
+                total_stats["files"]["renamed"] + total_stats["files"]["moved"],
+                key=lambda x: x.get("path", "")
+            )
+            for file_info in renamed_moved:
+                summary_lines.append(f"- {file_info['path']}")
+        
         return '\n'.join(summary_lines)
     
     def get_diff_summary(self) -> Dict[str, Any]:
@@ -656,49 +633,8 @@ class GitAnalyzer:
         Returns:
             包含统计信息的字典和代码块列表的元组
         """
-        stats = {
-            "insertions": 0,
-            "deletions": 0,
-            "modifications": 0
-        }
-        
-        current_block = []
-        code_blocks = []
-        in_header = True
-        
-        for line in diff_content.split('\n'):
-            # 跳过diff头部信息
-            if in_header:
-                if line.startswith('+++') or line.startswith('---'):
-                    continue
-                if line.startswith('@@'):
-                    in_header = False
-                continue
-            
-            # 统计变更
-            if line.startswith('+') and not line.startswith('+++'):
-                stats["insertions"] += 1
-                current_block.append(line)
-            elif line.startswith('-') and not line.startswith('---'):
-                stats["deletions"] += 1
-                current_block.append(line)
-            elif line.startswith('@@'):
-                # 新的代码块开始
-                if current_block:
-                    code_blocks.append('\n'.join(current_block))
-                    current_block = []
-            else:
-                # 上下文行
-                if current_block:
-                    current_block.append(line)
-        
-        # 添加最后一个代码块
-        if current_block:
-            code_blocks.append('\n'.join(current_block))
-        
-        stats["modifications"] = min(stats["insertions"], stats["deletions"])
-        
-        return stats, code_blocks
+        # 使用工具函数进行分析
+        return analyze_diff_content(diff_content)
         
     def _calculate_impact_score(self, diff_stats: Dict[str, Any]) -> float:
         """
@@ -936,53 +872,76 @@ class GitAnalyzer:
         Returns:
             摘要信息列表
         """
-        summary = []
+        # 获取基本信息
         path = file_stat.get("path", "")
         extension = file_stat.get("extension", "").lower()
+        content = file_stat.get("diff_content", "")
+        is_binary = file_stat.get("is_binary", False)
         
-        # 根据文件路径和扩展名识别文件类型和用途
+        # 对于常见文件类型，保留简单规则匹配
         if path.lower() == ".gitignore":
-            summary.append("添加 Git 忽略规则文件")
-            summary.append("配置了需要 Git 忽略的文件类型和目录")
+            return ["添加Git忽略规则文件"]
         elif path.lower() in ["readme.md", "readme"]:
-            summary.append("添加项目说明文档")
-            summary.append("包含项目概述、安装和使用说明")
+            return ["添加项目说明文档"]
         elif path.lower() in ["license", "license.md", "license.txt"]:
-            summary.append("添加开源许可证文件")
-        elif extension == "py":
-            summary.append("添加 Python 源代码文件")
-            # 尝试识别文件内容特征
-            if not file_stat.get("is_binary") and file_stat.get("diff_content"):
-                content = file_stat.get("diff_content", "")
-                if "class " in content:
-                    summary.append("定义了新的类")
-                if "def " in content:
-                    summary.append("实现了新的函数/方法")
-                if "import " in content or "from " in content:
-                    summary.append("引入了依赖模块")
-                if "test" in path.lower() or "test" in content.lower():
-                    summary.append("增加了测试用例")
-        elif extension in ["js", "ts", "jsx", "tsx"]:
-            summary.append(f"添加 {'TypeScript' if extension in ['ts', 'tsx'] else 'JavaScript'} 源代码文件")
-            if "react" in path.lower() or "component" in path.lower():
-                summary.append("实现了新的界面组件")
-        elif extension in ["html", "css", "scss", "sass"]:
-            summary.append(f"添加 {extension.upper()} 文件")
-            summary.append("更新了网页界面样式/结构")
-        elif extension in ["json", "yaml", "yml", "toml", "xml"]:
-            summary.append(f"添加 {extension.upper()} 配置文件")
-        elif extension in ["md", "rst", "txt"]:
-            summary.append("添加文档文件")
+            return ["添加开源许可证文件"]
+        
+        # 使用简单的关键词分析进行智能推断
+        summary = []
+        file_type = ""
+        file_purpose = ""
+        
+        # 确定文件类型
+        if extension == "py":
+            file_type = "Python"
+        elif extension in ["js", "jsx"]:
+            file_type = "JavaScript"
+        elif extension in ["ts", "tsx"]:
+            file_type = "TypeScript"
+        elif extension == "html":
+            file_type = "HTML"
+        elif extension == "css":
+            file_type = "CSS"
+        elif extension in ["md", "txt"]:
+            file_type = "文档"
+        elif extension in ["json", "yaml", "yml", "toml"]:
+            file_type = "配置"
         elif extension in ["sh", "bash", "ps1", "bat", "cmd"]:
-            summary.append("添加脚本文件")
-        
-        # 如果没有识别出特定类型
-        if not summary:
-            if file_stat.get("is_binary"):
-                summary.append(f"添加二进制文件: {path}")
-            else:
-                summary.append(f"添加新文件: {path}")
-        
+            file_type = "脚本"
+        elif is_binary:
+            file_type = "二进制"
+        else:
+            file_type = "源代码"
+            
+        # 确定文件用途
+        if "test" in path.lower() or content and "test" in content.lower():
+            file_purpose = "测试"
+        elif "config" in path.lower() or "settings" in path.lower():
+            file_purpose = "配置"
+        elif "util" in path.lower() or "helper" in path.lower():
+            file_purpose = "工具"
+        elif "component" in path.lower():
+            file_purpose = "UI组件"
+        elif "api" in path.lower() or "service" in path.lower():
+            file_purpose = "服务/API"
+        elif "model" in path.lower() or "schema" in path.lower() or "entity" in path.lower():
+            file_purpose = "数据模型"
+        elif "controller" in path.lower() or "handler" in path.lower():
+            file_purpose = "控制器"
+        else:
+            # 从文件名猜测用途
+            filename = path.split("/")[-1] if "/" in path else path
+            basename = filename.split(".")[0] if "." in filename else filename
+            file_purpose = basename.replace("_", " ").replace("-", " ")
+            
+        # 如果有明确的类型和用途，生成更有意义的摘要
+        if file_type and file_purpose:
+            summary.append(f"添加{file_type}{file_purpose}文件")
+        elif file_type:
+            summary.append(f"添加{file_type}文件")
+        else:
+            summary.append(f"添加新文件")
+            
         return summary
     
     def _extract_change_summary(self, file_stat: Dict[str, Any]) -> List[str]:
@@ -997,14 +956,26 @@ class GitAnalyzer:
         """
         summary = []
         
-        # 添加变更描述
+        # 添加更有意义的变更描述
         if file_stat.get("change_type") in ["renamed", "moved"]:
-            summary.append("文件位置发生变化")
+            summary.append("移动或重命名文件")
         
-        if file_stat.get("insertions") or file_stat.get("deletions"):
-            summary.append(
-                f"修改了 {file_stat.get('insertions', 0) + file_stat.get('deletions', 0)} 行代码"
-            )
+        insertions = file_stat.get("insertions", 0)
+        deletions = file_stat.get("deletions", 0)
+        total_changes = insertions + deletions
+        
+        if total_changes > 0:
+            if insertions > 0 and deletions > 0:
+                if insertions > deletions * 2:
+                    summary.append("大量添加新内容")
+                elif deletions > insertions * 2:
+                    summary.append("移除大部分代码")
+                else:
+                    summary.append("重构或更新实现")
+            elif insertions > 0:
+                summary.append("添加新功能或内容")
+            elif deletions > 0:
+                summary.append("移除旧代码或功能")
         
         # 根据文件类型添加更多信息
         extension = file_stat.get("extension", "").lower()
@@ -1018,7 +989,7 @@ class GitAnalyzer:
     
     def _identify_important_changes(self, files_stats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        识别重要的变更
+        识别重要的变更，优先选择更改较大的文件，并处理同一文件的增删记录
         
         Args:
             files_stats: 文件变更统计信息列表
@@ -1031,76 +1002,155 @@ class GitAnalyzer:
             self.logger.warning(f"无效的文件变更统计信息: {type(files_stats)}")
             return []
             
-        # 安全地排序文件变更
-        try:
-            # 过滤确保每个项都是有效的字典，并包含必要的路径信息
-            valid_stats = []
-            for stat in files_stats:
-                if isinstance(stat, dict) and stat.get("path"):
-                    valid_stats.append(stat)
-                else:
-                    self.logger.warning(f"跳过无效的文件统计信息: {stat}")
-            
-            # 排序有效的文件统计
-            if valid_stats:
-                sorted_stats = sorted(
-                    valid_stats,
-                    key=lambda x: self._calculate_impact_score(x),
-                    reverse=True
-                )
-            else:
-                self.logger.warning("没有找到有效的文件变更统计信息")
-                return []
-        except Exception as e:
-            self.logger.warning(f"排序文件变更时出错: {str(e)}")
-            # 如果排序失败，尝试使用原始列表中的有效项
-            sorted_stats = [stat for stat in files_stats if isinstance(stat, dict) and stat.get("path")]
-            if not sorted_stats:
-                return []
+        # 过滤出有效的文件统计信息
+        valid_stats = [stat for stat in files_stats if isinstance(stat, dict) and stat.get("path")]
+        if not valid_stats:
+            self.logger.warning("没有找到有效的文件变更统计信息")
+            return []
         
-        important_changes = []
-        for stat in sorted_stats[:5]:  # 最多返回5个重要变更
-            try:
-                # 安全处理每个变更
-                change = {
-                    "path": stat.get("path", "unknown"),
-                    "change_type": stat.get("change_type", "modified"),
-                    "impact_score": self._calculate_impact_score(stat),
+        # 按文件路径对变更进行分组，处理同一文件的多个变更
+        changes_by_file = {}
+        for stat in valid_stats:
+            path = stat.get("path", "")
+            if not path:
+                continue
+                
+            change_type = stat.get("change_type", "modified")
+            impact_score = self._calculate_impact_score(stat)
+            
+            # 如果文件已在跟踪中，决定保留哪个变更
+            if path in changes_by_file:
+                existing = changes_by_file[path]
+                existing_type = existing["change_type"]
+                
+                # 处理同一文件的增删记录，只保留最终状态
+                # 如果文件先被添加后被删除，最终状态是不存在（跳过该文件）
+                if change_type == "deleted" and existing_type == "added":
+                    del changes_by_file[path]
+                    continue
+                # 如果文件先被删除后被添加，最终状态是被修改
+                elif change_type == "added" and existing_type == "deleted":
+                    changes_by_file[path]["change_type"] = "modified"
+                    changes_by_file[path]["stat"] = stat
+                # 否则保留影响分数更高的变更
+                elif impact_score > existing["impact_score"]:
+                    changes_by_file[path]["change_type"] = change_type
+                    changes_by_file[path]["impact_score"] = impact_score
+                    changes_by_file[path]["stat"] = stat
+            else:
+                # 新增跟踪
+                changes_by_file[path] = {
+                    "change_type": change_type,
+                    "impact_score": impact_score,
+                    "stat": stat
                 }
+        
+        # 按影响分数排序
+        sorted_changes = sorted(
+            list(changes_by_file.values()),
+            key=lambda x: x["impact_score"],
+            reverse=True
+        )
+        
+        # 生成重要变更列表
+        important_changes = []
+        # 最多返回8个重要变更，但尝试包含不同类型的文件
+        file_types_included = set()
+        for change_info in sorted_changes:
+            if len(important_changes) >= 8:
+                break
                 
-                # 确保每个变更都有摘要信息
-                try:
-                    # 为不同类型的变更生成适当的摘要
-                    if stat.get("change_type") == "added":
-                        change["summary"] = self._extract_new_file_summary(stat)
-                    else:
-                        change["summary"] = self._extract_change_summary(stat)
-                except Exception as e:
-                    self.logger.warning(f"生成变更摘要时出错: {str(e)}")
-                    # 确保即使摘要生成失败，也有一个空的摘要列表
-                    change["summary"] = ["文件已变更"]
+            stat = change_info["stat"]
+            path = stat.get("path", "unknown")
+            change_type = change_info["change_type"]
+            
+            # 尝试包含不同类型的文件
+            file_ext = os.path.splitext(path)[1].lower()
+            file_type = self._categorize_file_type(path, file_ext[1:] if file_ext else "")
+            
+            # 如果已经包含了3个同类型的文件，并且还有其他变更，跳过此类型
+            if file_type in file_types_included and len(file_types_included) > 1 and len(important_changes) > 3:
+                continue
                 
-                # 安全添加代码块预览
-                try:
-                    if not stat.get("is_binary") and stat.get("code_blocks"):
-                        code_blocks = stat.get("code_blocks", [])
-                        if isinstance(code_blocks, list) and code_blocks:
-                            significant_blocks = self._get_significant_blocks(code_blocks, max_blocks=2)
-                            if significant_blocks:
-                                change["code_preview"] = significant_blocks
-                except Exception as e:
-                    self.logger.warning(f"处理代码块时出错: {str(e)}")
-                
-                # 添加处理好的变更
-                important_changes.append(change)
+            file_types_included.add(file_type)
+            
+            # 构建变更信息
+            change = {
+                "path": path,
+                "change_type": change_type,
+                "impact_score": change_info["impact_score"],
+            }
+            
+            # 添加文件内容推测的用途
+            try:
+                # 为不同类型的变更生成适当的摘要
+                if change_type == "added":
+                    # 对于新文件，尝试根据文件类型和内容推测用途
+                    change["summary"] = self._extract_new_file_summary(stat)
+                else:
+                    # 对于修改的文件，提取变更的内容
+                    change["summary"] = self._extract_change_summary(stat)
+                    
+                # 确保summary是有意义的
+                if not change.get("summary"):
+                    change["summary"] = [f"{file_type}文件已{change_type_desc.get(change_type, change_type)}"]
             except Exception as e:
-                self.logger.warning(f"处理重要变更时出错: {str(e)}")
-                # 添加基本信息而不失败
-                important_changes.append({
-                    "path": stat.get("path", "unknown"),
-                    "change_type": stat.get("change_type", "unknown"),
-                    "impact_score": 0.5,
-                    "summary": []
-                })
+                self.logger.warning(f"生成变更摘要时出错: {str(e)}")
+                change["summary"] = [f"文件已{change_type_desc.get(change_type, change_type)}"]
+            
+            # 添加diff内容预览
+            if not stat.get("is_binary", False) and "diff_content" in stat:
+                diff_content = stat.get("diff_content", "")
+                if diff_content:
+                    # 获取有意义的diff片段
+                    change["diff_preview"] = self._extract_meaningful_diff_preview(diff_content)
+            
+            # 添加处理好的变更
+            important_changes.append(change)
         
         return important_changes
+    
+    def __init__(self, repo_path: str = GIT_DEFAULT_REPO_PATH):
+        """
+        初始化Git分析器
+        
+        Args:
+            repo_path: Git仓库路径，默认为当前目录
+        
+        Raises:
+            ValueError: 如果指定的路径不是一个有效的Git仓库
+        """
+        try:
+            self.repo = Repo(repo_path)
+            if self.repo.bare:
+                raise ValueError(f"裸仓库不支持: {repo_path}")
+        except Exception as e:
+            raise ValueError(f"{ERROR_GIT_REPO_NOT_FOUND.format(repo_path)}: {str(e)}")
+        
+        self.repo_path = repo_path
+        self._diff_summary = None
+        self.logger = logging.getLogger(__name__)
+        
+        # 加载配置，用于diff行数限制等设置
+        from sf_ai_commit.config import ConfigManager
+        self.config = ConfigManager().config
+        
+    def _extract_meaningful_diff_preview(self, diff_content: str) -> str:
+        """
+        从diff内容中提取有意义的预览
+        
+        Args:
+            diff_content: 差异内容
+            
+        Returns:
+            有意义的差异预览
+        """
+        if not diff_content:
+            return ""
+            
+        # 从配置中获取显示行数设置
+        max_lines = self.config.get("preferences", {}).get("diff_max_lines", 20)
+            
+        # 使用工具函数提取有意义的diff内容
+        meaningful_lines = extract_meaningful_diff_content(diff_content, max_lines)
+        return "\n".join(meaningful_lines)

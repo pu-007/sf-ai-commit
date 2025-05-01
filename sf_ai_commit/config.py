@@ -61,6 +61,10 @@ class ConfigManager:
                 "detailed_by_default": False,
                 "max_message_length": DEFAULT_MAX_MESSAGE_LENGTH,
                 "editor_command": DEFAULT_EDITOR,
+                "diff_max_lines": 20,  # 显示的差异内容行数，0 表示全部显示
+            },
+            "git": {
+                "diff_encoding": "utf-8",  # Git差异内容的编码
             }
         }
     

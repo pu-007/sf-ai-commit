@@ -114,8 +114,9 @@ class SFAICommit:
                 try:
                     with self.interaction.show_loading("正在生成提交消息..."):
                         llm_response = self.llm_service.generate_commit_message(
-                            diff_summary, 
-                            detailed=detailed
+                            diff_summary,
+                            detailed=detailed,
+                            verbose=self.args.verbose  # 添加verbose参数
                         )
                         
                     # 格式化提交消息
@@ -129,12 +130,14 @@ class SFAICommit:
                     confirmed, edited_message, regenerate = self.interaction.confirm_message(commit_message)
                     
                     if regenerate:
+                        #TODO: 用户附加要求然后重新生成
                         should_regenerate = True
                         continue
                     elif not confirmed:
                         self.interaction.show_info("已取消提交")
                         return 0
                     else:
+                        #TODO: 编辑后到选择界面，选择是否根据这个重新生成
                         # 使用编辑后的消息
                         commit_message = edited_message
                         should_regenerate = False
@@ -160,7 +163,8 @@ class SFAICommit:
                                 # 尝试使用简化的差异信息生成提交消息
                                 llm_response = self.llm_service.generate_commit_message(
                                     simple_diff,
-                                    detailed=False
+                                    detailed=False,
+                                    verbose=self.args.verbose  # 添加verbose参数
                                 )
                                 
                                 # 格式化提交消息
@@ -237,7 +241,7 @@ class SFAICommit:
         parser.add_argument("--init", action="store_true", help="创建默认配置文件")
         parser.add_argument("--no-color", action="store_true", help="禁用彩色输出")
         parser.add_argument("--dry-run", action="store_true", help="只生成消息但不实际提交")
-        parser.add_argument("--verbose", action="store_true", help="显示详细日志")
+        parser.add_argument("--verbose", action="store_true", help="显示详细日志和提示词信息")
         parser.add_argument("--repo-path", default=".", help="Git仓库路径")
         parser.add_argument("files", nargs="*", help="要添加到暂存区的文件或文件夹路径")
         

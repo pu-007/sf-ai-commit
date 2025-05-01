@@ -178,7 +178,7 @@ sf-ai-commit 提供了以下命令行选项：
 | `--init`           |        | 创建默认配置文件                    |
 | `--no-color`       |        | 禁用彩色输出                        |
 | `--dry-run`        |        | 只生成消息但不实际提交              |
-| `--verbose`        |        | 显示详细日志                        |
+| `--verbose`        |        | 显示详细日志和提示词信息            |
 | `--repo-path PATH` |        | 指定 Git 仓库路径（默认为当前目录） |
 | `--help`           | `-h`   | 显示帮助信息并退出                  |
 
@@ -194,9 +194,47 @@ sf-ai-commit --config /path/to/my-config.yaml
 # 只生成消息但不提交（预览模式）
 sf-ai-commit --dry-run
 
+# 显示提示词和详细日志信息（调试模式）
+sf-ai-commit --verbose
+
 # 在不同目录的 Git 仓库中工作
 sf-ai-commit --repo-path /path/to/repo
 ```
+
+#### 输出格式
+
+sf-ai-commit 支持两种输出格式：
+
+1. **默认模式**：只输出一行简洁的提交消息，符合 Conventional Commits 规范：
+
+   ```
+   feat(lang): add Polish language
+   ```
+
+2. **详细模式**（使用 `--detailed` 参数）：输出完整的 Conventional Commits 格式，包括主题行、正文和页脚：
+
+   ```
+   fix: prevent racing of requests
+
+   Introduce a request id and a reference to latest request. Dismiss
+   incoming responses other than from latest request.
+
+   Remove timeouts which were used to mitigate the racing issue but are
+   obsolete now.
+
+   Reviewed-by: Z
+   Refs: #123
+   ```
+
+#### 调试模式
+
+使用 `--verbose` 参数可以启用调试模式，此模式会显示：
+
+1. 发送给 AI 模型的完整提示词
+2. 详细的日志信息
+3. API 调用细节
+
+这对于调试和改进提示词非常有用。
 
 ### 配置文件设置
 
