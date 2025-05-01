@@ -1,0 +1,2 @@
+[console_scripts]
+sf-ai-commit = sf_ai_commit.cli:main
