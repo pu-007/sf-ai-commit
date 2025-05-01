@@ -83,7 +83,7 @@ class InteractionManager:
         
         # 提示用户选择操作
         choice = Prompt.ask(
-            "请选择操作",
+            "请选择操作(确认/取消/编辑/重新生成)",
             choices=[str(i+1) for i in range(len(CONFIRM_OPTIONS))],
             default="1"
         )
