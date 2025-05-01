@@ -88,8 +88,39 @@ class LLMService:
         # 获取差异摘要文本
         diff_text = diff_summary.get("summary", "")
         
+        # 获取重要变更信息，如果不存在则使用空字符串
+        important_changes_list = diff_summary.get("important_changes", [])
+        
+        # 将重要变更列表转换为字符串格式
+        if important_changes_list and isinstance(important_changes_list, list):
+            important_changes_items = []
+            for change in important_changes_list:
+                if isinstance(change, dict):
+                    path = change.get("path", "未知文件")
+                    change_type = change.get("change_type", "修改")
+                    summary = change.get("summary", [])
+                    
+                    # 确保summary是列表
+                    if not isinstance(summary, list):
+                        summary = [str(summary)]
+                    
+                    # 构建变更项描述
+                    change_desc = f"- {path} ({change_type}):"
+                    if summary:
+                        change_desc += "\n  " + "\n  ".join(summary)
+                    important_changes_items.append(change_desc)
+                else:
+                    important_changes_items.append(f"- {str(change)}")
+            
+            important_changes_text = "\n".join(important_changes_items)
+        else:
+            important_changes_text = "没有检测到重要变更"
+        
         # 构建基础提示词
-        prompt = DEFAULT_PROMPT_TEMPLATE.format(diff_summary=diff_text)
+        prompt = DEFAULT_PROMPT_TEMPLATE.format(
+            diff_summary=diff_text,
+            important_changes=important_changes_text
+        )
         
         # 如果需要详细消息，添加详细提示词扩展
         if detailed:

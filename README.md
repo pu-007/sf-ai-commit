@@ -6,9 +6,12 @@
 
 sf-ai-commit 是一个智能命令行工具，利用 AI 大模型自动分析 Git 暂存区的变更，生成符合 [Conventional Commits](https://www.conventionalcommits.org/) 规范的提交消息。它让开发者摆脱编写 commit 消息的负担，同时保持提交历史的一致性和可读性。
 
+> **注意**：sf-ai-commit 默认只处理已添加到暂存区（使用 `git add` 命令添加）的文件。未暂存的变更将被忽略。
+
 ### 主要功能
 
 - **智能分析**：分析 Git 暂存区变更，理解代码修改意图
+- **直接暂存文件**：可在命令行直接指定要添加到暂存区的文件或文件夹
 - **标准格式**：生成符合 Conventional Commits 规范的提交消息
 - **交互式界面**：美观丰富的命令行输出，支持彩色显示
 - **灵活确认**：支持确认/取消/重新生成/编辑生成的消息
@@ -48,6 +51,10 @@ sf-ai-commit --init
 
 ### 基本使用流程
 
+sf-ai-commit 提供两种主要使用方式：
+
+#### 方式一：先暂存文件，再生成提交
+
 1. 添加要提交的文件到暂存区：
 
 ```bash
@@ -60,7 +67,17 @@ git add file1.py file2.py
 sf-ai-commit
 ```
 
-3. 审核生成的提交消息，可以选择确认、取消、编辑或重新生成。
+#### 方式二：直接指定文件/文件夹
+
+直接在命令行中指定要添加的文件或文件夹，sf-ai-commit 会自动将它们添加到暂存区然后生成提交消息：
+
+```bash
+sf-ai-commit file1.py directory1/ file2.js
+```
+
+这相当于先执行 `git add file1.py directory1/ file2.js` 然后再运行 `sf-ai-commit`。
+
+3. 无论使用哪种方式，都可以审核生成的提交消息，并选择确认、取消、编辑或重新生成。
 
 ## 4. 配置选项
 
@@ -89,7 +106,7 @@ llm:
   timeout: 30
   # API请求头
   headers: {}
-  # API密钥（可选，也可通过环境变量设置）
+  # API密钥（可选，也可通过环境变量设置 OPENAI_API_KEY）
   api_key: ""
   # 温度参数(0.0-1.0)，控制生成结果的随机性
   temperature: 0.7
@@ -173,6 +190,7 @@ sf-ai-commit 提供了多种命令行选项以满足不同使用场景：
 | `--verbose`        |      | 显示详细日志                        |
 | `--repo-path PATH` |      | 指定 Git 仓库路径（默认为当前目录） |
 | `--help`           | `-h` | 显示帮助信息并退出                  |
+| `FILES...`         |      | 要添加到暂存区的文件或文件夹路径    |
 
 ## 6. 实际使用场景示例
 
@@ -181,8 +199,12 @@ sf-ai-commit 提供了多种命令行选项以满足不同使用场景：
 当你修复了一个 bug 并想快速提交时：
 
 ```bash
+# 方式一：先暂存文件，再生成提交
 git add src/components/login.js
 sf-ai-commit
+
+# 方式二：直接指定文件
+sf-ai-commit src/components/login.js
 ```
 
 生成的消息可能类似于：`fix(auth): 修复登录表单验证失败问题`
@@ -192,8 +214,12 @@ sf-ai-commit
 当你完成了一个重要功能并希望提供详细说明时：
 
 ```bash
+# 方式一：先暂存文件，再生成提交
 git add src/features/payment/ tests/payment/
 sf-ai-commit --detailed
+
+# 方式二：直接指定文件夹
+sf-ai-commit --detailed src/features/payment/ tests/payment/
 ```
 
 生成的消息可能类似于：
@@ -212,10 +238,24 @@ feat(payment): 添加支付宝支付集成功能
 当你想先查看并可能编辑生成的消息，但不立即提交：
 
 ```bash
+# 针对已暂存的文件
 sf-ai-commit --dry-run
+
+# 或者指定文件并预览
+sf-ai-commit --dry-run src/components/*.js
 ```
 
 这将生成消息但不执行实际提交，让你有机会查看并决定是否采用。
+
+### 场景四：批量添加多个文件和目录
+
+当你想一次性添加多个不同类型的文件和目录：
+
+```bash
+sf-ai-commit src/*.py docs/ package.json README.md
+```
+
+这将添加所有匹配的文件和目录到暂存区，然后基于这些变更生成提交消息。
 
 ## 7. 如何贡献
 

@@ -6,7 +6,7 @@ import os
 import sys
 import argparse
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Sequence
 
 from sf_ai_commit import __version__
 from sf_ai_commit.config import ConfigManager
@@ -73,6 +73,15 @@ class SFAICommit:
                 self.interaction.show_error(str(e))
                 return 1
                 
+            # 处理指定的文件/文件夹
+            if self.args.files:
+                try:
+                    with self.interaction.show_loading(f"正在添加指定的文件到暂存区..."):
+                        self.git_analyzer.stage_files(self.args.files)
+                except Exception as e:
+                    self.interaction.show_error(f"添加文件到暂存区失败: {str(e)}")
+                    return 1
+            
             # 获取Git差异
             try:
                 with self.interaction.show_loading("正在分析Git变更..."):
@@ -83,10 +92,11 @@ class SFAICommit:
                     return 1
                     
                 if diff_summary["total_files"] == 0:
-                    self.interaction.show_error("没有暂存的变更，请先使用 'git add' 添加变更")
+                    self.interaction.show_error("没有暂存的变更，请先使用 'git add' 添加变更或使用 sf-ai-commit [文件路径...] 指定文件")
                     return 1
             except Exception as e:
                 self.interaction.show_error(f"分析Git变更失败: {str(e)}")
+                logging.exception("Git分析错误详情")
                 return 1
                 
             # 初始化LLM服务
@@ -111,6 +121,7 @@ class SFAICommit:
                     # 格式化提交消息
                     commit_message = self.message_generator.format_message(
                         llm_response,
+                        diff_info=diff_summary,
                         detailed=detailed
                     )
                     
@@ -129,9 +140,58 @@ class SFAICommit:
                         should_regenerate = False
                         
                 except Exception as e:
-                    self.interaction.show_error(f"生成提交消息失败: {str(e)}")
-                    should_regenerate = False
-                    return 1
+                    error_msg = str(e)
+                    self.interaction.show_error(f"生成提交消息失败: {error_msg}")
+                    # 添加更具体的错误提示
+                    if "important_changes" in error_msg:
+                        self.interaction.show_info("解析变更信息时出错，尝试重新分析...")
+                        try:
+                            # 再次尝试生成提交消息，使用兜底方案
+                            with self.interaction.show_loading("重新尝试生成提交消息..."):
+                                # 创建一个简单的差异摘要用于兜底
+                                simple_diff = {
+                                    "files": diff_summary.get("files", []),
+                                    "total_files": diff_summary.get("total_files", 0),
+                                    "important_changes": [],  # 使用空的重要变更列表
+                                    "stats": diff_summary.get("stats", {}),
+                                    "repo_info": diff_summary.get("repo_info", {})
+                                }
+                                
+                                # 尝试使用简化的差异信息生成提交消息
+                                llm_response = self.llm_service.generate_commit_message(
+                                    simple_diff,
+                                    detailed=False
+                                )
+                                
+                                # 格式化提交消息
+                                commit_message = self.message_generator.format_message(
+                                    llm_response,
+                                    diff_info=simple_diff,
+                                    detailed=False
+                                )
+                                
+                                # 用户确认
+                                confirmed, edited_message, regenerate = self.interaction.confirm_message(commit_message)
+                                
+                                if regenerate:
+                                    should_regenerate = True
+                                    continue
+                                elif not confirmed:
+                                    self.interaction.show_info("已取消提交")
+                                    return 0
+                                else:
+                                    # 使用编辑后的消息
+                                    commit_message = edited_message
+                                    should_regenerate = False
+                            
+                        except Exception as backup_error:
+                            self.interaction.show_error(f"兜底方案也失败了: {str(backup_error)}")
+                            logging.exception("兜底生成提交消息失败")
+                            should_regenerate = False
+                            return 1
+                    else:
+                        should_regenerate = False
+                        return 1
             
             # 执行提交
             if not self.args.dry_run:
@@ -156,7 +216,7 @@ class SFAICommit:
             logging.exception("未处理的异常")
             return 1
             
-    def parse_args(self, args: Optional[List[str]] = None) -> argparse.Namespace:
+    def parse_args(self, args: Optional[Sequence[str]] = None) -> argparse.Namespace:
         """
         解析命令行参数
         
@@ -179,6 +239,7 @@ class SFAICommit:
         parser.add_argument("--dry-run", action="store_true", help="只生成消息但不实际提交")
         parser.add_argument("--verbose", action="store_true", help="显示详细日志")
         parser.add_argument("--repo-path", default=".", help="Git仓库路径")
+        parser.add_argument("files", nargs="*", help="要添加到暂存区的文件或文件夹路径")
         
         return parser.parse_args(args)
 
